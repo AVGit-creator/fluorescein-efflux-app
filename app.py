@@ -89,11 +89,6 @@ def get_y_range_rounded(cells, fit_results, round_base=5, padding_fraction=0.1):
     y_max_r = math.ceil((y_max + padding) / round_base) * round_base
     return y_min_r, y_max_r
 
-def get_plotly_safe_y_max(counts, min_pad=5, frac_pad=0.1):
-    tallest = np.max(counts) if len(counts) > 0 else 1
-    pad = max(min_pad, int(tallest * frac_pad))
-    return tallest + pad
-
 # --- MAIN APP ---
 if uploaded_file is not None:
     file_content = uploaded_file.getvalue()
@@ -237,7 +232,6 @@ if uploaded_file is not None:
             counts, bins = np.histogram(k_filt, bins=bin_edges)
             widths = np.diff(bins)
             centres = (bins[:-1] + bins[1:]) / 2
-
             gap_fraction = 0.2
             bar_widths = widths * (1 - gap_fraction)
 
@@ -260,12 +254,16 @@ if uploaded_file is not None:
                     name="Step Plot", line=dict(color=hist_color, width=3)
                 ))
 
-            y_axis_max = get_plotly_safe_y_max(counts)
+            # Add manual Y-axis override
+            max_count = counts.max()
+            y_padding = max(1, int(max_count * 0.1))
+            default_y_max = max_count + y_padding
+            manual_y_max = st.slider("Y-axis max (Count)", min_value=default_y_max, max_value=default_y_max * 5, value=default_y_max, step=1)
 
             fig_hist.update_layout(
                 title="Histogram of kMDR Values",
-                xaxis=dict(title="k<sub>MDR</sub> (min<sup>-1</sup>)", range=[min_k, max_k_cap]),
-                yaxis=dict(title="Count", range=[0, y_axis_max]),
+                xaxis=dict(title="k<sub>MDR</sub> (min<sup>-1</sup>)", range=[0.0, max_k_cap]),
+                yaxis=dict(title="Count", range=[0, manual_y_max]),
                 height=450,
                 bargap=0.2,
                 margin=dict(l=50, r=40, t=40, b=60),
