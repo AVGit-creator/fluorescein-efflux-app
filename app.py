@@ -4,6 +4,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 import plotly.graph_objs as go
 import math
+import io
 
 st.title("Fluorescein Efflux Single-Cell Kinetics")
 
@@ -19,13 +20,21 @@ def r_squared(y, y_fit):
     ss_tot = np.sum((y - np.mean(y))**2)
     return 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
 
-# --- FITTING FUNCTION ---
-def fit_all_cells(df):
+# --- LOAD & CACHE ---
+@st.cache_data
+def load_csv_from_content(file_bytes: bytes):
+    df = pd.read_csv(io.BytesIO(file_bytes), header=None)
+    df.columns = ["Time"] + [f"Cell {i}" for i in range(1, len(df.columns))]
+    df["Time"] = pd.to_numeric(df["Time"], errors='coerce')
+    df.iloc[:, 1:] = df.iloc[:, 1:].round(3)
+    return df
+
+@st.cache_data
+def cached_fit_all_cells(df: pd.DataFrame):
     results = {}
     xdata = df["Time"].values.astype(float)
     for cell in df.columns[1:]:
         ydata = df[cell].values.astype(float)
-
         y0_init = ydata[-1]
         A_init = ydata[0] - y0_init
         Tau_init = 3
@@ -80,7 +89,6 @@ def get_y_range_rounded(cells, fit_results, round_base=5, padding_fraction=0.1):
     y_max_r = math.ceil((y_max + padding) / round_base) * round_base
     return y_min_r, y_max_r
 
-# --- FINAL FIX: Histogram Y-Axis Helper ---
 def get_plotly_safe_y_max(counts, min_pad=5, frac_pad=0.1):
     tallest = np.max(counts) if len(counts) > 0 else 1
     pad = max(min_pad, int(tallest * frac_pad))
@@ -88,12 +96,9 @@ def get_plotly_safe_y_max(counts, min_pad=5, frac_pad=0.1):
 
 # --- MAIN APP ---
 if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file, header=None)
-    df.columns = ["Time"] + [f"Cell {i}" for i in range(1, len(df.columns))]
-    df["Time"] = pd.to_numeric(df["Time"], errors='coerce')
-    df.iloc[:, 1:] = df.iloc[:, 1:].round(3)
-
-    fit_results = fit_all_cells(df)
+    file_content = uploaded_file.getvalue()
+    df = load_csv_from_content(file_content)
+    fit_results = cached_fit_all_cells(df)
 
     succ = sum(1 for r in fit_results.values() if r["status"] == "Success")
     fail = sum(1 for r in fit_results.values() if r["status"] == "Failed")
@@ -108,8 +113,7 @@ if uploaded_file is not None:
     match_y = st.checkbox("Match Y-axis scale for selected cells", True)
     all_overlay = st.checkbox("Overlay all cells", False)
 
-    cells_for_graph = [cell for cell, res in fit_results.items()
-                       if not (rm_fail and res['status'] == 'Failed')]
+    cells_for_graph = [cell for cell, res in fit_results.items() if not (rm_fail and res['status'] == 'Failed')]
 
     st.write("### Select cells to plot")
     sel = st.multiselect("Select cells", cells_for_graph, default=cells_for_graph[:2])
@@ -256,7 +260,6 @@ if uploaded_file is not None:
                     name="Step Plot", line=dict(color=hist_color, width=3)
                 ))
 
-            # ✅ Final Fix: y-axis never undershoots bar height
             y_axis_max = get_plotly_safe_y_max(counts)
 
             fig_hist.update_layout(
