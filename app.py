@@ -5,12 +5,112 @@ from scipy.optimize import curve_fit
 import plotly.graph_objs as go
 import math
 import io
+import re
 
+# =========================
+# TOP-OF-PAGE: Equation Selector
+# =========================
 st.title("Fluorescein Efflux Single-Cell Kinetics")
 
-uploaded_file = st.file_uploader("Upload CSV file", type="csv")
+st.markdown("### Model Selection")
+eq_mode = st.radio(
+    "Choose the curve-fitting model:",
+    ["Exponential decay (y = y0 + A * exp(-x / Tau))", "Custom equation"],
+    index=0,
+    help="Use the built-in exponential model or supply your own equation in terms of x and parameters."
+)
 
-# --- MODEL ---
+# --- Defaults / Inputs for Custom Equation ---
+custom_eq = None
+custom_params = []
+custom_p0 = None
+custom_bounds = None
+
+def parse_float_list(s):
+    """Parse a comma-separated string of floats into a list. Returns None if s is empty/blank."""
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    out = []
+    for p in s.split(","):
+        p = p.strip()
+        if p == "":
+            continue
+        out.append(float(p))
+    return out
+
+if eq_mode == "Custom equation":
+    with st.container():
+        st.markdown("**Enter your equation in terms of `x` and your parameters.**")
+        st.caption("Example: `y0 + A * np.exp(-x / Tau)` or `B / (1 + (x/x0)**n)`")
+        custom_eq = st.text_input(
+            "Equation (RHS only):",
+            value="y0 + A * np.exp(-x / Tau)",
+            help="Write only the right-hand side; `y =` is not needed. You can use NumPy via `np.`"
+        )
+        params_str = st.text_input(
+            "Parameter names (comma-separated, order matters):",
+            value="y0, A, Tau",
+            help="List the parameter names you use in the equation, in the order they should be fit."
+        )
+        # --- Mini explanations for new users (non-intrusive guidance) ---
+        with st.expander("What do common parameters usually mean?"):
+            st.markdown(
+                "- **y0**: Baseline intensity, the starting fluorescence prior to efflux. \n"
+                "- **y**: Fluorescence intensity at any given time point for a single cell. \n"
+                "- **x**: Represents the time \n"
+                "- **A**: (Amplitude) The magnitude of the  drop in intensity caused by efflux.\n"
+                "- **Tau**: Time constant or the rate at which fluorescence changes. How quickly the curve falls.\n"
+                "- **TD**: (Threshold decay) Time where the cell is actively pumping out fluorescein or when efflux begins.\n"
+                "- **n**: Exponent parameter controlling curve steepness.\n"
+                "- **k**: Rate constant."
+            )
+
+        p0_str = st.text_input(
+            "Initial guesses p0 (comma-separated, optional):",
+            value="",
+            help="Optional initial guesses for parameters. Leave blank to auto-guess (if possible)."
+        )
+        lb_str = st.text_input(
+            "Lower bounds (comma-separated, optional):",
+            value="",
+            help="Optional lower bounds. Leave blank for no lower bounds (i.e. -inf)."
+        )
+        ub_str = st.text_input(
+            "Upper bounds (comma-separated, optional):",
+            value="",
+            help="Optional upper bounds. Leave blank for no upper bounds (i.e. +inf)."
+        )
+
+        # Parse param names
+        custom_params = [p.strip() for p in params_str.split(",") if p.strip()]
+
+        # Parse p0 and bounds
+        custom_p0 = parse_float_list(p0_str)
+        lb = parse_float_list(lb_str)
+        ub = parse_float_list(ub_str)
+
+        if lb is None and ub is None:
+            custom_bounds = None
+        else:
+            npar = len(custom_params)
+            if lb is None:
+                lb = [-np.inf] * npar
+            if ub is None:
+                ub = [np.inf] * npar
+            if len(lb) < npar:
+                lb = lb + [-np.inf] * (npar - len(lb))
+            if len(ub) < npar:
+                ub = ub + [np.inf] * (npar - len(ub))
+            lb = lb[:npar]
+            ub = ub[:npar]
+            custom_bounds = (lb, ub)
+
+# =========================
+# MODEL HELPERS
+# =========================
 def exp_decay(x, y0, A, Tau):
     return y0 + A * np.exp(-x / Tau)
 
@@ -20,7 +120,40 @@ def r_squared(y, y_fit):
     ss_tot = np.sum((y - np.mean(y))**2)
     return 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
 
-# --- LOAD & CACHE ---
+_ALLOWED_NUMPY = {
+    'np': np, 'numpy': np,
+    'exp': np.exp, 'log': np.log, 'log10': np.log10, 'log2': np.log2,
+    'sqrt': np.sqrt, 'abs': np.abs,
+    'sin': np.sin, 'cos': np.cos, 'tan': np.tan,
+    'arcsin': np.arcsin, 'arccos': np.arccos, 'arctan': np.arctan,
+    'sinh': np.sinh, 'cosh': np.cosh, 'tanh': np.tanh,
+    'power': np.power, 'pow': np.power, 'where': np.where,
+}
+
+def make_custom_model(eq_str, param_names):
+    """Build a callable f(x, *params) from an equation string and ordered parameter names."""
+    if not eq_str or not param_names:
+        raise ValueError("Custom equation and parameter names must be provided.")
+    forbidden = ["__import__", "os.", "sys.", "open(", "exec(", "eval(", "globals(", "locals("]
+    low = eq_str.lower().replace(" ", "")
+    for fbd in forbidden:
+        if fbd in low:
+            raise ValueError("Forbidden token in custom equation.")
+
+    def f(x, *theta):
+        if len(theta) != len(param_names):
+            raise ValueError("Parameter length mismatch in custom model.")
+        local_ns = {'x': x}
+        for name, val in zip(param_names, theta):
+            local_ns[name] = val
+        return eval(eq_str, {"__builtins__": {}}, {**_ALLOWED_NUMPY, **local_ns})
+    # attach param names so we can find Tau later
+    f._param_names = list(param_names)
+    return f
+
+# =========================
+# LOAD & CACHE
+# =========================
 @st.cache_data
 def load_csv_from_content(file_bytes: bytes):
     df = pd.read_csv(io.BytesIO(file_bytes), header=None)
@@ -30,30 +163,83 @@ def load_csv_from_content(file_bytes: bytes):
     return df
 
 @st.cache_data
-def cached_fit_all_cells(df: pd.DataFrame):
+def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
+    """
+    Cache-friendly fitter. Reconstructs the model from a serializable spec.
+    model_spec:
+      - {'mode': 'exp'}
+      - {'mode': 'custom', 'eq': str, 'params': [..], 'p0': [..] or None,
+         'bounds': (lb_list, ub_list) or None}
+    """
+    # Rebuild model + p0 builder + bounds from spec
+    if model_spec['mode'] == 'exp':
+        model_fn = exp_decay
+        bounds = ([-np.inf, -np.inf, 0.1], [np.inf, np.inf, 1000])
+
+        def p0_builder(xdata, ydata):
+            y0_init = ydata[-1]
+            A_init = ydata[0] - y0_init
+            Tau_init = 3.0
+            return [y0_init, A_init, Tau_init]
+
+        tau_name = "Tau"
+        param_names = ["y0", "A", "Tau"]
+
+    else:
+        model_fn = make_custom_model(model_spec['eq'], model_spec['params'])
+        bounds = model_spec.get('bounds', None)
+        user_p0 = model_spec.get('p0', None)
+        param_names = list(model_spec['params'])
+        # Try to find a Tau-like index by name
+        tau_name = "Tau" if "Tau" in param_names else None
+
+        def p0_builder(xdata, ydata):
+            if user_p0 is not None and len(user_p0) == len(param_names):
+                return user_p0
+            # Heuristics if p0 not provided
+            p0_guess = []
+            for name in param_names:
+                if name.lower() == "y0":
+                    p0_guess.append(float(ydata[-1]))
+                elif name.lower() in ("a", "amp", "amplitude"):
+                    p0_guess.append(float(ydata[0] - ydata[-1]))
+                elif name.lower() in ("tau", "t", "tc", "timeconst"):
+                    p0_guess.append(3.0)
+                else:
+                    p0_guess.append(1.0)
+            return p0_guess
+
+    # Fit loop
     results = {}
     xdata = df["Time"].values.astype(float)
     for cell in df.columns[1:]:
         ydata = df[cell].values.astype(float)
-        y0_init = ydata[-1]
-        A_init = ydata[0] - y0_init
-        Tau_init = 3
-        p0 = [y0_init, A_init, Tau_init]
 
         try:
-            popt, pcov = curve_fit(
-                exp_decay, xdata, ydata, p0=p0,
-                bounds=([-np.inf, -np.inf, 0.1], [np.inf, np.inf, 1000]),
-                maxfev=3000
-            )
-            y_fit = exp_decay(xdata, *popt)
+            p0 = p0_builder(xdata, ydata)
+            if bounds is None:
+                popt, pcov = curve_fit(model_fn, xdata, ydata, p0=p0, maxfev=5000)
+            else:
+                popt, pcov = curve_fit(model_fn, xdata, ydata, p0=p0, bounds=bounds, maxfev=5000)
+
+            y_fit = model_fn(xdata, *popt)
             r2 = r_squared(ydata, y_fit)
-            perr = np.sqrt(np.diag(pcov))
-            stderr_tau = perr[2] if len(perr) > 2 else np.nan
-            rel_err = stderr_tau / popt[2] if popt[2] != 0 else np.nan
-            status = "Success" if r2 > 0.9 and rel_err < 0.3 else "Failed"
+            perr = np.sqrt(np.diag(pcov)) if pcov is not None else None
+
+            # Determine Tau-like parameter and its stderr (only meaningful if present)
+            Tau_val, stderr_tau = np.nan, np.nan
+            if tau_name is not None and tau_name in param_names:
+                idx = param_names.index(tau_name)
+                Tau_val = popt[idx] if popt is not None and idx < len(popt) else np.nan
+                if perr is not None and idx < len(perr):
+                    stderr_tau = perr[idx]
+
+            rel_err = (stderr_tau / Tau_val) if (Tau_val not in [0, None] and not np.isnan(Tau_val)) else np.nan
+
+            # Keep your original success rule
+            status = "Success" if (r2 > 0.9 and (not np.isnan(rel_err) and rel_err < 0.3)) else "Failed"
         except Exception:
-            popt, y_fit, r2, status, stderr_tau = None, None, 0, "Failed", np.nan
+            popt, y_fit, r2, status, stderr_tau, Tau_val = None, None, 0, "Failed", np.nan, np.nan
 
         results[cell] = {
             "popt": popt,
@@ -61,13 +247,16 @@ def cached_fit_all_cells(df: pd.DataFrame):
             "r2": r2,
             "status": status,
             "ydata": ydata,
-            "stderr_tau": stderr_tau
+            "stderr_tau": stderr_tau,
+            "Tau_like": Tau_val
         }
     return results
 
-# --- PLOTTING ---
+# =========================
+# PLOTTING
+# =========================
 def create_trace(x, y, y_fit, cell, color):
-    traces = [go.Scatter(x=x, y=y, mode='markers', name=f'{cell} Data', marker=dict(color=color, size=6))]    
+    traces = [go.Scatter(x=x, y=y, mode='markers', name=f'{cell} Data', marker=dict(color=color, size=6))]
     if y_fit is not None:
         traces.append(go.Scatter(x=x, y=y_fit, mode='lines', name=f'{cell} Fit', line=dict(color=color, dash='dash')))
     return traces
@@ -89,12 +278,78 @@ def get_y_range_rounded(cells, fit_results, round_base=5, padding_fraction=0.1):
     y_max_r = math.ceil((y_max + padding) / round_base) * round_base
     return y_min_r, y_max_r
 
-# --- MAIN APP ---
+# =========================
+# HELPERS
+# =========================
+def sort_cells_ascending(cells):
+    """
+    Sorts by numeric suffix if present (e.g., 'Cell 2' < 'Cell 10').
+    Non-numeric names are placed after numeric ones, in alphabetical order.
+    """
+    def key_fn(name):
+        m = re.search(r'(\d+)$', name.strip())
+        if m:
+            return (0, int(m.group(1)), name)
+        return (1, float('inf'), name.lower())
+    return sorted(cells, key=key_fn)
+
+# ---------- NEW HELPERS: Excel-style column labels for cells ----------
+def _excel_col_letter(n: int) -> str:
+    """1 -> 'A', 2 -> 'B', ..., 27 -> 'AA'"""
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+def cell_to_excel_letter(cell_name: str) -> str:
+    """
+    Returns the Excel-style column letter for a given 'Cell N'.
+    Time is column 'A'. Therefore, Cell 1 maps to 'B', Cell 2 -> 'C', etc.
+    """
+    m = re.search(r'(\d+)$', cell_name.strip())
+    if not m:
+        return ""
+    n = int(m.group(1))
+    return _excel_col_letter(n + 1)  # +1 because 'A' is Time
+# ---------------------------------------------------------------------
+
+# =========================
+# FILE UPLOAD (after model choice)
+# =========================
+uploaded_file = st.file_uploader("Upload CSV file", type="csv")
+
+# =========================
+# MAIN APP
+# =========================
 if uploaded_file is not None:
     file_content = uploaded_file.getvalue()
     df = load_csv_from_content(file_content)
-    fit_results = cached_fit_all_cells(df)
 
+    # Build a SERIALIZABLE model spec for caching
+    if eq_mode.startswith("Exponential"):
+        model_spec = {'mode': 'exp'}
+        model_label = "y = y0 + A * exp(-x / Tau)"
+    else:
+        if not custom_eq or not custom_params:
+            st.error("Please provide a custom equation and parameter names.")
+            st.stop()
+        model_spec = {
+            'mode': 'custom',
+            'eq': custom_eq,
+            'params': list(custom_params),
+            'p0': list(custom_p0) if custom_p0 is not None else None,
+            'bounds': custom_bounds  # tuple of lists or None
+        }
+        model_label = f"y = {custom_eq} | params: {', '.join(custom_params)}"
+
+    # Fit all cells (cached by df contents + model_spec contents)
+    fit_results = cached_fit_all_cells(df, model_spec)
+
+    # Summary header with model info
+    st.info(f"**Model in use:** {model_label}")
+
+    # Metrics
     succ = sum(1 for r in fit_results.values() if r["status"] == "Success")
     fail = sum(1 for r in fit_results.values() if r["status"] == "Failed")
     total = len(fit_results)
@@ -103,6 +358,7 @@ if uploaded_file is not None:
     c2.metric("Failures", fail)
     c3.metric("Total Cells", total)
 
+    # Graph controls
     st.write("## Graph Options and Filters")
     rm_fail = st.checkbox("Remove failed fits from graph", True)
     match_y = st.checkbox("Match Y-axis scale for selected cells", True)
@@ -177,14 +433,20 @@ if uploaded_file is not None:
     for cell, r in fit_results.items():
         if rm_fail_tab and r['status'] == 'Failed':
             continue
-        Tau = r['popt'][2] if r['popt'] is not None else np.nan
+        Tau = r.get('Tau_like', np.nan)
         st_err = r['stderr_tau'] if r['stderr_tau'] is not None else np.nan
         ratio = st_err / Tau if Tau and Tau != 0 else np.nan
         if rm_high_err and not np.isnan(ratio) and ratio > 1:
             continue
-        k_val = 1 / Tau if Tau and Tau != 0 else np.nan
+        k_val = 1 / Tau if Tau and Tau != 0 and not np.isnan(Tau) else np.nan
+
+        # Show cell number with its Excel column letter (Cell 1 = B, Cell 2 = C, ...)
+        excel_letter = cell_to_excel_letter(cell)
+        cell_display = f"{cell} ({excel_letter})" if excel_letter else cell
+
         rows.append({
-            "Cell": cell,
+            "CellRaw": cell,          # keep the raw name for internal logic
+            "Cell": cell_display,     # display name in the table
             "Tau": Tau,
             "STError": st_err,
             "STError/Tau": ratio,
@@ -192,10 +454,14 @@ if uploaded_file is not None:
             "Status": r['status']
         })
     df_table = pd.DataFrame(rows)
-    if sort_desc:
-        df_table = df_table.sort_values(by="STError/Tau", ascending=False)
+    if sort_desc and "STError/Tau" in df_table.columns:
+        df_table = df_table.sort_values(by="STError/Tau", ascending=False, na_position="last")
     st.write("### Fit Parameter Table")
-    st.dataframe(df_table.style.format({"Tau": "{:.3f}", "STError": "{:.3f}", "STError/Tau": "{:.3f}", "k": "{:.4f}"}))
+    st.dataframe(
+        df_table.drop(columns=["CellRaw"]).style.format(
+            {"Tau": "{:.3f}", "STError": "{:.3f}", "STError/Tau": "{:.3f}", "k": "{:.4f}"}
+        )
+    )
 
     # --- HISTOGRAM ---
     st.write("## Histogram of kMDR values")
@@ -213,7 +479,13 @@ if uploaded_file is not None:
         show_bars = st.checkbox("Show Histogram Bars", True)
         show_step = st.checkbox("Show Step Plot", True)
 
-        k_filt = k_vals[k_vals <= max_k_cap]
+        # Use the raw cell names here to preserve sorting and mapping
+        k_source = df_table.loc[
+            (df_table['Status'] == 'Success') & df_table['k'].notna() & (df_table['k'] <= max_k_cap),
+            ['CellRaw', 'k']
+        ].rename(columns={'CellRaw': 'Cell'})
+        k_filt = k_source['k'].values
+
         if len(k_filt) == 0:
             st.write("No k values less than or equal to the cap to plot.")
         else:
@@ -228,12 +500,22 @@ if uploaded_file is not None:
                 bin_edges += list(np.linspace(min_nonzero_k, max_k_cap, num=30)[1:])
                 bin_edges = np.round(bin_edges, 6)
 
-            st.write(f"Number of histogram bins: {len(bin_edges) - 1}")
             counts, bins = np.histogram(k_filt, bins=bin_edges)
             widths = np.diff(bins)
             centres = (bins[:-1] + bins[1:]) / 2
             gap_fraction = 0.2
             bar_widths = widths * (1 - gap_fraction)
+
+            # Y-axis extension slider
+            auto_ymax = int(np.max(counts)) if len(counts) else 10
+            ymax_upper_bound = max(auto_ymax * 5, auto_ymax + 10)
+            y_max_limit = st.slider(
+                "Y-axis upper limit (extend if tall bins get clipped)",
+                min_value=int(max(1, auto_ymax)),
+                max_value=int(ymax_upper_bound),
+                value=int(auto_ymax),
+                step=1
+            )
 
             fig_hist = go.Figure()
             if show_bars:
@@ -254,16 +536,10 @@ if uploaded_file is not None:
                     name="Step Plot", line=dict(color=hist_color, width=3)
                 ))
 
-            # Add manual Y-axis override
-            max_count = counts.max()
-            y_padding = max(1, int(max_count * 0.1))
-            default_y_max = max_count + y_padding
-            manual_y_max = st.slider("Y-axis max (Count)", min_value=default_y_max, max_value=default_y_max * 5, value=default_y_max, step=1)
-
             fig_hist.update_layout(
                 title="Histogram of kMDR Values",
                 xaxis=dict(title="k<sub>MDR</sub> (min<sup>-1</sup>)", range=[0.0, max_k_cap]),
-                yaxis=dict(title="Count", range=[0, manual_y_max]),
+                yaxis=dict(title="Count", range=[0, y_max_limit]),
                 height=450,
                 bargap=0.2,
                 margin=dict(l=50, r=40, t=40, b=60),
@@ -271,3 +547,36 @@ if uploaded_file is not None:
             )
 
             st.plotly_chart(fig_hist, use_container_width=True)
+
+            # --- Bin selector with range + center ---
+            bin_labels = []
+            for i in range(len(bins)-1):
+                center = (bins[i] + bins[i+1]) / 2
+                # FIX: Correctly close with ')' except last bin, which closes with ']'
+                if i == len(bins) - 2:
+                    label = f"[{bins[i]:.4f}, {bins[i+1]:.4f}] | center: {center:.4f}"
+                else:
+                    label = f"[{bins[i]:.4f}, {bins[i+1]:.4f}) | center: {center:.4f}"
+                bin_labels.append(label)
+
+            chosen_bin = st.selectbox("Select a bin (range + center) to see cells", bin_labels)
+            if chosen_bin:
+                idx = bin_labels.index(chosen_bin)
+                low, high = bins[idx], bins[idx+1]
+                if idx == len(bins) - 2:
+                    mask = (k_source['k'] >= low) & (k_source['k'] <= high)
+                else:
+                    mask = (k_source['k'] >= low) & (k_source['k'] < high)
+                cells_in_bin = list(k_source.loc[mask, 'Cell'])
+
+                # Vertical, numerically ascending list using raw names
+                cells_sorted = sort_cells_ascending(cells_in_bin)
+                st.markdown(f"**Cells in bin {chosen_bin}:**")
+                if cells_sorted:
+                    # Show the Excel letter next to each raw cell name (Cell 1 = B, Cell 2 = C, ...)
+                    st.markdown("\n".join(
+                        f"{i}. {cell} ({cell_to_excel_letter(cell)})"
+                        for i, cell in enumerate(cells_sorted, start=1)
+                    ))
+                else:
+                    st.markdown("None")
