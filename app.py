@@ -15,9 +15,13 @@ st.title("Fluorescein Efflux Single-Cell Kinetics")
 st.markdown("### Model Selection")
 eq_mode = st.radio(
     "Choose the curve-fitting model:",
-    ["Exponential decay (y = y0 + A * exp(-x / Tau))", "Custom equation"],
+    [
+        "Exponential decay (y = y0 + A * exp(-x / Tau))",
+        "Exponential increase with delay (y = Yb + A * (1 - exp(-(x - TD) / Tau)))",
+        "Custom equation",
+    ],
     index=0,
-    help="Use the built-in exponential model or supply your own equation in terms of x and parameters."
+    help="Use a built-in model or supply your own equation in terms of x and parameters."
 )
 
 # --- Defaults / Inputs for Custom Equation ---
@@ -58,13 +62,13 @@ if eq_mode == "Custom equation":
         # --- Mini explanations for new users (non-intrusive guidance) ---
         with st.expander("What do common parameters usually mean?"):
             st.markdown(
-                "- **y0**: Baseline intensity, the starting fluorescence prior to efflux. \n"
-                "- **y**: Fluorescence intensity at any given time point for a single cell. \n"
-                "- **x**: Represents the time \n"
-                "- **A**: (Amplitude) The magnitude of the  drop in intensity caused by efflux.\n"
-                "- **Tau**: Time constant or the rate at which fluorescence changes. How quickly the curve falls.\n"
-                "- **TD**: (Threshold decay) Time where the cell is actively pumping out fluorescein or when efflux begins.\n"
-                "- **n**: Exponent parameter controlling curve steepness.\n"
+                "- **y0 / Yb**: Baseline intensity.\n"
+                "- **y**: Fluorescence intensity at any given time point for a single cell.\n"
+                "- **x**: Time.\n"
+                "- **A**: Amplitude (magnitude of change).\n"
+                "- **Tau**: Time constant controlling the rate.\n"
+                "- **TD**: Delay/onset time.\n"
+                "- **n**: Exponent controlling steepness (for Hill-like forms).\n"
                 "- **k**: Rate constant."
             )
 
@@ -113,6 +117,10 @@ if eq_mode == "Custom equation":
 # =========================
 def exp_decay(x, y0, A, Tau):
     return y0 + A * np.exp(-x / Tau)
+
+def exp_increase_delay(x, Yb, A, Tau, TD):
+    # Your specified equation (no piecewise alteration)
+    return Yb + A * (1.0 - np.exp(-(x - TD) / Tau))
 
 def r_squared(y, y_fit):
     residuals = y - y_fit
@@ -168,9 +176,16 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
     Cache-friendly fitter. Reconstructs the model from a serializable spec.
     model_spec:
       - {'mode': 'exp'}
+      - {'mode': 'exp_increase'}
       - {'mode': 'custom', 'eq': str, 'params': [..], 'p0': [..] or None,
          'bounds': (lb_list, ub_list) or None}
     """
+    # Global ranges to set sane bounds for built-in models
+    xdata_full = df["Time"].values.astype(float)
+    x_min, x_max = float(np.nanmin(xdata_full)), float(np.nanmax(xdata_full))
+    y_all = df.iloc[:, 1:].values.astype(float)
+    y_min, y_max = float(np.nanmin(y_all)), float(np.nanmax(y_all)) if y_all.size else (0.0, 1.0)
+
     # Rebuild model + p0 builder + bounds from spec
     if model_spec['mode'] == 'exp':
         model_fn = exp_decay
@@ -184,6 +199,37 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
 
         tau_name = "Tau"
         param_names = ["y0", "A", "Tau"]
+
+    elif model_spec['mode'] == 'exp_increase':
+        model_fn = exp_increase_delay
+        # Strong, sensible bounds to prevent wild deviations
+        # Yb within observed range; A >= 0; Tau positive; TD within time window
+        bounds = (
+            [y_min,          0.0,   0.1,  x_min],     # [Yb, A, Tau, TD] lower
+            [y_max,      np.inf,  1000.,  x_max]      # upper
+        )
+
+        def p0_builder(xdata, ydata):
+            # Baseline as early average (first 10% of points), fall back to first point
+            n = max(1, int(0.1 * len(ydata)))
+            Yb_init = float(np.nanmean(ydata[:n])) if n > 0 else float(ydata[0])
+
+            # Amplitude as rise from baseline to late average
+            m = max(1, int(0.1 * len(ydata)))
+            A_init = float(np.nanmean(ydata[-m:]) - Yb_init)
+
+            # Delay: first time index where signal exceeds baseline by 10% of amplitude (guarded)
+            A_pos = A_init if A_init > 0 else (float(np.nanmax(ydata) - Yb_init))
+            threshold = Yb_init + 0.1 * max(A_pos, 1e-6)
+            idxs = np.where(ydata >= threshold)[0]
+            TD_init = float(xdata[idxs[0]]) if len(idxs) > 0 else float(xdata[0])
+
+            # Tau: modest default
+            Tau_init = 3.0
+            return [Yb_init, max(A_init, 1e-3), Tau_init, TD_init]
+
+        tau_name = "Tau"
+        param_names = ["Yb", "A", "Tau", "TD"]
 
     else:
         model_fn = make_custom_model(model_spec['eq'], model_spec['params'])
@@ -201,10 +247,14 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
             for name in param_names:
                 if name.lower() == "y0":
                     p0_guess.append(float(ydata[-1]))
+                elif name.lower() in ("yb",):
+                    p0_guess.append(float(np.nanmean(ydata[:max(1, int(0.1*len(ydata)))])))
                 elif name.lower() in ("a", "amp", "amplitude"):
-                    p0_guess.append(float(ydata[0] - ydata[-1]))
+                    p0_guess.append(float(ydata[-1] - ydata[0]))
                 elif name.lower() in ("tau", "t", "tc", "timeconst"):
                     p0_guess.append(3.0)
+                elif name.lower() in ("td", "delay", "onset"):
+                    p0_guess.append(float(xdata[0]))
                 else:
                     p0_guess.append(1.0)
             return p0_guess
@@ -226,6 +276,13 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
             r2 = r_squared(ydata, y_fit)
             perr = np.sqrt(np.diag(pcov)) if pcov is not None else None
 
+            # Map parameter names to values for easy access (Amplitude, etc.)
+            param_map = {}
+            if popt is not None:
+                for i, name in enumerate(param_names):
+                    if i < len(popt):
+                        param_map[name] = popt[i]
+
             # Determine Tau-like parameter and its stderr (only meaningful if present)
             Tau_val, stderr_tau = np.nan, np.nan
             if tau_name is not None and tau_name in param_names:
@@ -240,9 +297,11 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
             status = "Success" if (r2 > 0.9 and (not np.isnan(rel_err) and rel_err < 0.3)) else "Failed"
         except Exception:
             popt, y_fit, r2, status, stderr_tau, Tau_val = None, None, 0, "Failed", np.nan, np.nan
+            param_map = {}
 
         results[cell] = {
             "popt": popt,
+            "params": param_map,        # <-- for Amplitude lookup
             "y_fit": y_fit,
             "r2": r2,
             "status": status,
@@ -255,10 +314,10 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
 # =========================
 # PLOTTING
 # =========================
-def create_trace(x, y, y_fit, cell, color):
-    traces = [go.Scatter(x=x, y=y, mode='markers', name=f'{cell} Data', marker=dict(color=color, size=6))]
+def create_trace(x, y, y_fit, label, color):
+    traces = [go.Scatter(x=x, y=y, mode='markers', name=f'{label} Data', marker=dict(color=color, size=6))]
     if y_fit is not None:
-        traces.append(go.Scatter(x=x, y=y_fit, mode='lines', name=f'{cell} Fit', line=dict(color=color, dash='dash')))
+        traces.append(go.Scatter(x=x, y=y_fit, mode='lines', name=f'{label} Fit', line=dict(color=color, dash='dash')))
     return traces
 
 def get_y_range_rounded(cells, fit_results, round_base=5, padding_fraction=0.1):
@@ -312,6 +371,11 @@ def cell_to_excel_letter(cell_name: str) -> str:
         return ""
     n = int(m.group(1))
     return _excel_col_letter(n + 1)  # +1 because 'A' is Time
+
+def cell_with_letter(cell_name: str) -> str:
+    """Return 'Cell N (Letter)' when a valid letter exists."""
+    letter = cell_to_excel_letter(cell_name)
+    return f"{cell_name} ({letter})" if letter else cell_name
 # ---------------------------------------------------------------------
 
 # =========================
@@ -327,10 +391,16 @@ if uploaded_file is not None:
     df = load_csv_from_content(file_content)
 
     # Build a SERIALIZABLE model spec for caching
-    if eq_mode.startswith("Exponential"):
+    if eq_mode.startswith("Exponential decay"):
         model_spec = {'mode': 'exp'}
         model_label = "y = y0 + A * exp(-x / Tau)"
+        is_exp_mode = True
+    elif eq_mode.startswith("Exponential increase"):
+        model_spec = {'mode': 'exp_increase'}
+        model_label = "y = Yb + A * (1 - exp(-(x - TD) / Tau))"
+        is_exp_mode = True
     else:
+        is_exp_mode = False
         if not custom_eq or not custom_params:
             st.error("Please provide a custom equation and parameter names.")
             st.stop()
@@ -366,8 +436,21 @@ if uploaded_file is not None:
 
     cells_for_graph = [cell for cell, res in fit_results.items() if not (rm_fail and res['status'] == 'Failed')]
 
+    # ---------- UPDATED: cell dropdown shows Excel letters in built-in modes ----------
     st.write("### Select cells to plot")
-    sel = st.multiselect("Select cells", cells_for_graph, default=cells_for_graph[:2])
+    if is_exp_mode:
+        label_map = {cell_with_letter(c): c for c in cells_for_graph}
+        options = list(label_map.keys())
+        # Keep same default cells but mapped to labels
+        default_labels = [cell_with_letter(c) for c in cells_for_graph[:2]]
+        sel_labels = st.multiselect("Select cells", options=options, default=default_labels)
+        # Map labels back to raw cell names
+        sel = [label_map[l] for l in sel_labels]
+    else:
+        # Custom mode: leave as original names
+        sel = st.multiselect("Select cells", options=cells_for_graph, default=cells_for_graph[:2])
+    # -------------------------------------------------------------------
+
     mode = st.radio("Comparison mode", ["Overlay", "Side by side"], index=0)
 
     x = df["Time"].values.astype(float)
@@ -380,7 +463,9 @@ if uploaded_file is not None:
         fig = go.Figure()
         for i, (cell, r) in enumerate(fit_results.items()):
             clr = f'rgba({(i*53)%255},{(i*97)%255},{(i*191)%255},0.5)'
-            fig.add_trace(go.Scatter(x=x, y=r['ydata'], mode='lines+markers', name=cell,
+            # For built-in modes, append the Excel letter to the label
+            label = cell_with_letter(cell) if is_exp_mode else cell
+            fig.add_trace(go.Scatter(x=x, y=r['ydata'], mode='lines+markers', name=label,
                                      line=dict(color=clr), marker=dict(size=4, opacity=0.6)))
         y0, y1 = get_y_range_rounded(fit_results.keys(), fit_results)
         fig.update_layout(title="Overlay of All Cells",
@@ -395,7 +480,8 @@ if uploaded_file is not None:
             colors = ['blue','red','green','orange','purple','brown','pink','gray']
             for cell, col in zip(sel, colors):
                 r = fit_results[cell]
-                for tr in create_trace(x, r['ydata'], r['y_fit'], cell, col):
+                label = cell_with_letter(cell) if is_exp_mode else cell
+                for tr in create_trace(x, r['ydata'], r['y_fit'], label, col):
                     fig.add_trace(tr)
             fig.update_layout(xaxis=dict(title="Time", range=x_range, showline=True, linewidth=1,
                                          linecolor='black', mirror=True, ticks='outside', showgrid=False, zeroline=False),
@@ -409,7 +495,8 @@ if uploaded_file is not None:
             for idx, cell in enumerate(sel):
                 r = fit_results[cell]
                 fig = go.Figure()
-                for tr in create_trace(x, r['ydata'], r['y_fit'], cell, 'blue'):
+                label = cell_with_letter(cell) if is_exp_mode else cell
+                for tr in create_trace(x, r['ydata'], r['y_fit'], label, 'blue'):
                     fig.add_trace(tr)
                 y0, y1 = (y0g, y1g) if match_y else (min(r['ydata']), max(r['ydata']))
                 fig.update_layout(xaxis=dict(title="Time", range=x_range, showline=True, linewidth=1,
@@ -417,7 +504,7 @@ if uploaded_file is not None:
                                   yaxis=dict(title="Intensity", showline=True, linewidth=1,
                                              linecolor='black', mirror=True, ticks='outside', showgrid=False,
                                              range=[y0, y1]),
-                                  annotations=[dict(text=f"<b>{cell}</b>", x=0.5, y=1.12,
+                                  annotations=[dict(text=f"<b>{label}</b>", x=0.5, y=1.12,
                                                     xref="paper", yref="paper", showarrow=False,
                                                     font=dict(size=16), xanchor='center')],
                                   height=400, margin=dict(l=60, r=20, t=60, b=50))
@@ -440,6 +527,11 @@ if uploaded_file is not None:
             continue
         k_val = 1 / Tau if Tau and Tau != 0 and not np.isnan(Tau) else np.nan
 
+        # Amplitude (A) when present
+        amp_val = np.nan
+        if isinstance(r.get("params"), dict) and "A" in r["params"]:
+            amp_val = r["params"]["A"]
+
         # Show cell number with its Excel column letter (Cell 1 = B, Cell 2 = C, ...)
         excel_letter = cell_to_excel_letter(cell)
         cell_display = f"{cell} ({excel_letter})" if excel_letter else cell
@@ -451,6 +543,7 @@ if uploaded_file is not None:
             "STError": st_err,
             "STError/Tau": ratio,
             "k": k_val,
+            "Amplitude": amp_val,
             "Status": r['status']
         })
     df_table = pd.DataFrame(rows)
@@ -459,7 +552,7 @@ if uploaded_file is not None:
     st.write("### Fit Parameter Table")
     st.dataframe(
         df_table.drop(columns=["CellRaw"]).style.format(
-            {"Tau": "{:.3f}", "STError": "{:.3f}", "STError/Tau": "{:.3f}", "k": "{:.4f}"}
+            {"Tau": "{:.3f}", "STError": "{:.3f}", "STError/Tau": "{:.3f}", "k": "{:.4f}", "Amplitude": "{:.3f}"}
         )
     )
 
