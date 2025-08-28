@@ -10,6 +10,7 @@ import re
 # =========================
 # TOP-OF-PAGE: Equation Selector
 # =========================
+st.set_page_config(page_title="Fluorescein Efflux Single-Cell Kinetics", layout="centered")
 st.title("Fluorescein Efflux Single-Cell Kinetics")
 
 st.markdown("### Model Selection")
@@ -17,7 +18,7 @@ eq_mode = st.radio(
     "Choose the curve-fitting model:",
     [
         "Exponential decay (y = y0 + A * exp(-x / Tau))",
-        "Exponential increase with delay (y = Yb + A * (1 - exp(-(x - TD) / Tau)))",
+        "Exponential increase (y = Yb + A * (1 - exp(-x / Tau))",
         "Custom equation",
     ],
     index=0,
@@ -59,7 +60,7 @@ if eq_mode == "Custom equation":
             value="y0, A, Tau",
             help="List the parameter names you use in the equation, in the order they should be fit."
         )
-        # --- Mini explanations for new users (non-intrusive guidance) ---
+        # --- Mini explanations for new users ---
         with st.expander("What do common parameters usually mean?"):
             st.markdown(
                 "- **y0 / Yb**: Baseline intensity.\n"
@@ -67,7 +68,7 @@ if eq_mode == "Custom equation":
                 "- **x**: Time.\n"
                 "- **A**: Amplitude (magnitude of change).\n"
                 "- **Tau**: Time constant controlling the rate.\n"
-                "- **TD**: Delay/onset time.\n"
+                "- **TD**: Delay/onset time (not used in the built-in models below).\n"
                 "- **n**: Exponent controlling steepness (for Hill-like forms).\n"
                 "- **k**: Rate constant."
             )
@@ -116,11 +117,12 @@ if eq_mode == "Custom equation":
 # MODEL HELPERS
 # =========================
 def exp_decay(x, y0, A, Tau):
+    # True decay shape is enforced by A >= 0 in bounds; curve rises toward y0 if A < 0, so we forbid that.
     return y0 + A * np.exp(-x / Tau)
 
-def exp_increase_delay(x, Yb, A, Tau, TD):
-    # Your specified equation (no piecewise alteration)
-    return Yb + A * (1.0 - np.exp(-(x - TD) / Tau))
+def exp_increase_nodelay(x, Yb, A, Tau):
+    # Rise from Yb at t=0 with no delay
+    return Yb + A * (1.0 - np.exp(-x / Tau))
 
 def r_squared(y, y_fit):
     residuals = y - y_fit
@@ -184,16 +186,20 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
     xdata_full = df["Time"].values.astype(float)
     x_min, x_max = float(np.nanmin(xdata_full)), float(np.nanmax(xdata_full))
     y_all = df.iloc[:, 1:].values.astype(float)
-    y_min, y_max = float(np.nanmin(y_all)), float(np.nanmax(y_all)) if y_all.size else (0.0, 1.0)
+    if y_all.size:
+        y_min, y_max = float(np.nanmin(y_all)), float(np.nanmax(y_all))
+    else:
+        y_min, y_max = 0.0, 1.0
 
     # Rebuild model + p0 builder + bounds from spec
     if model_spec['mode'] == 'exp':
         model_fn = exp_decay
-        bounds = ([-np.inf, -np.inf, 0.1], [np.inf, np.inf, 1000])
+        # Enforce true decay: A >= 0 ; Tau > 0
+        bounds = ([-np.inf, 0.0, 0.1], [np.inf, np.inf, 1000])
 
         def p0_builder(xdata, ydata):
-            y0_init = ydata[-1]
-            A_init = ydata[0] - y0_init
+            y0_init = float(ydata[-1])
+            A_init = max(float(ydata[0] - y0_init), 1e-6)  # nonnegative
             Tau_init = 3.0
             return [y0_init, A_init, Tau_init]
 
@@ -201,42 +207,29 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
         param_names = ["y0", "A", "Tau"]
 
     elif model_spec['mode'] == 'exp_increase':
-        model_fn = exp_increase_delay
-        # Strong, sensible bounds to prevent wild deviations
-        # Yb within observed range; A >= 0; Tau positive; TD within time window
+        model_fn = exp_increase_nodelay
+        # No delay: Yb within observed range; A >= 0; Tau > 0
         bounds = (
-            [y_min,          0.0,   0.1,  x_min],     # [Yb, A, Tau, TD] lower
-            [y_max,      np.inf,  1000.,  x_max]      # upper
+            [y_min, 0.0, 0.1],     # [Yb, A, Tau] lower
+            [y_max, np.inf, 1000]  # upper
         )
 
         def p0_builder(xdata, ydata):
-            # Baseline as early average (first 10% of points), fall back to first point
             n = max(1, int(0.1 * len(ydata)))
             Yb_init = float(np.nanmean(ydata[:n])) if n > 0 else float(ydata[0])
-
-            # Amplitude as rise from baseline to late average
             m = max(1, int(0.1 * len(ydata)))
-            A_init = float(np.nanmean(ydata[-m:]) - Yb_init)
-
-            # Delay: first time index where signal exceeds baseline by 10% of amplitude (guarded)
-            A_pos = A_init if A_init > 0 else (float(np.nanmax(ydata) - Yb_init))
-            threshold = Yb_init + 0.1 * max(A_pos, 1e-6)
-            idxs = np.where(ydata >= threshold)[0]
-            TD_init = float(xdata[idxs[0]]) if len(idxs) > 0 else float(xdata[0])
-
-            # Tau: modest default
+            A_init = max(float(np.nanmean(ydata[-m:]) - Yb_init), 1e-6)
             Tau_init = 3.0
-            return [Yb_init, max(A_init, 1e-3), Tau_init, TD_init]
+            return [Yb_init, A_init, Tau_init]
 
         tau_name = "Tau"
-        param_names = ["Yb", "A", "Tau", "TD"]
+        param_names = ["Yb", "A", "Tau"]
 
     else:
         model_fn = make_custom_model(model_spec['eq'], model_spec['params'])
         bounds = model_spec.get('bounds', None)
         user_p0 = model_spec.get('p0', None)
         param_names = list(model_spec['params'])
-        # Try to find a Tau-like index by name
         tau_name = "Tau" if "Tau" in param_names else None
 
         def p0_builder(xdata, ydata):
@@ -293,7 +286,7 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
 
             rel_err = (stderr_tau / Tau_val) if (Tau_val not in [0, None] and not np.isnan(Tau_val)) else np.nan
 
-            # Keep your original success rule
+            # Success rule
             status = "Success" if (r2 > 0.9 and (not np.isnan(rel_err) and rel_err < 0.3)) else "Failed"
         except Exception:
             popt, y_fit, r2, status, stderr_tau, Tau_val = None, None, 0, "Failed", np.nan, np.nan
@@ -301,7 +294,7 @@ def cached_fit_all_cells(df: pd.DataFrame, model_spec: dict):
 
         results[cell] = {
             "popt": popt,
-            "params": param_map,        # <-- for Amplitude lookup
+            "params": param_map,        # for Amplitude lookup
             "y_fit": y_fit,
             "r2": r2,
             "status": status,
@@ -352,7 +345,7 @@ def sort_cells_ascending(cells):
         return (1, float('inf'), name.lower())
     return sorted(cells, key=key_fn)
 
-# ---------- NEW HELPERS: Excel-style column labels for cells ----------
+# ---------- Excel-style column labels for cells ----------
 def _excel_col_letter(n: int) -> str:
     """1 -> 'A', 2 -> 'B', ..., 27 -> 'AA'"""
     letters = ""
@@ -376,7 +369,7 @@ def cell_with_letter(cell_name: str) -> str:
     """Return 'Cell N (Letter)' when a valid letter exists."""
     letter = cell_to_excel_letter(cell_name)
     return f"{cell_name} ({letter})" if letter else cell_name
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------
 
 # =========================
 # FILE UPLOAD (after model choice)
@@ -393,11 +386,11 @@ if uploaded_file is not None:
     # Build a SERIALIZABLE model spec for caching
     if eq_mode.startswith("Exponential decay"):
         model_spec = {'mode': 'exp'}
-        model_label = "y = y0 + A * exp(-x / Tau)"
+        model_label = "y = y0 + A * exp(-x / Tau) (A ≥ 0)"
         is_exp_mode = True
     elif eq_mode.startswith("Exponential increase"):
         model_spec = {'mode': 'exp_increase'}
-        model_label = "y = Yb + A * (1 - exp(-(x - TD) / Tau))"
+        model_label = "y = Yb + A * (1 - exp(-x / Tau)) (A ≥ 0)"
         is_exp_mode = True
     else:
         is_exp_mode = False
@@ -436,20 +429,16 @@ if uploaded_file is not None:
 
     cells_for_graph = [cell for cell, res in fit_results.items() if not (rm_fail and res['status'] == 'Failed')]
 
-    # ---------- UPDATED: cell dropdown shows Excel letters in built-in modes ----------
+    # Cell dropdown shows Excel letters in built-in modes
     st.write("### Select cells to plot")
     if is_exp_mode:
         label_map = {cell_with_letter(c): c for c in cells_for_graph}
         options = list(label_map.keys())
-        # Keep same default cells but mapped to labels
         default_labels = [cell_with_letter(c) for c in cells_for_graph[:2]]
         sel_labels = st.multiselect("Select cells", options=options, default=default_labels)
-        # Map labels back to raw cell names
         sel = [label_map[l] for l in sel_labels]
     else:
-        # Custom mode: leave as original names
         sel = st.multiselect("Select cells", options=cells_for_graph, default=cells_for_graph[:2])
-    # -------------------------------------------------------------------
 
     mode = st.radio("Comparison mode", ["Overlay", "Side by side"], index=0)
 
@@ -463,7 +452,6 @@ if uploaded_file is not None:
         fig = go.Figure()
         for i, (cell, r) in enumerate(fit_results.items()):
             clr = f'rgba({(i*53)%255},{(i*97)%255},{(i*191)%255},0.5)'
-            # For built-in modes, append the Excel letter to the label
             label = cell_with_letter(cell) if is_exp_mode else cell
             fig.add_trace(go.Scatter(x=x, y=r['ydata'], mode='lines+markers', name=label,
                                      line=dict(color=clr), marker=dict(size=4, opacity=0.6)))
@@ -582,11 +570,38 @@ if uploaded_file is not None:
         if len(k_filt) == 0:
             st.write("No k values less than or equal to the cap to plot.")
         else:
-            use_manual = st.checkbox("Manually set number of bins", False)
-            if use_manual:
+            # ---- NEW: explicit bin size controls ----
+            bin_mode = st.radio(
+                "Binning method",
+                ["Auto (adaptive)", "By number of bins", "By bin width"],
+                index=0,
+                horizontal=True,
+                help="Choose automatic bins, a fixed number of bins, or specify an exact bin width."
+            )
+
+            if bin_mode == "By number of bins":
                 n_bins = st.slider("Number of bins", min_value=1, max_value=200, value=30)
                 bin_edges = np.linspace(0.0, max_k_cap, n_bins + 1)
-            else:
+
+            elif bin_mode == "By bin width":
+                # Ensure a sensible default width from data spread (30 bins target)
+                default_width = max(max_k_cap / 30.0, 1e-6)
+                bin_width = st.number_input(
+                    "Bin width",
+                    min_value=1e-6,
+                    max_value=max(1e-6, float(max_k_cap)),
+                    value=float(np.round(default_width, 6)),
+                    step=0.0001,
+                    format="%.6f",
+                    help="Set the width of each bin. Bins start at 0 and extend to the cap."
+                )
+                # Guard against zero/NaN
+                bin_width = float(bin_width) if (bin_width is not None and bin_width > 0) else default_width
+                # Make sure last edge reaches (or slightly exceeds) max_k_cap
+                last_edge = max_k_cap + (bin_width - (max_k_cap % bin_width)) % bin_width
+                bin_edges = np.arange(0.0, last_edge + bin_width / 2, bin_width)
+
+            else:  # Auto (adaptive) — original behavior
                 non_zero_k_vals = k_filt[k_filt > 0]
                 min_nonzero_k = np.min(non_zero_k_vals) if len(non_zero_k_vals) > 0 else max_k_cap
                 bin_edges = [0.0, min_nonzero_k]
@@ -645,7 +660,7 @@ if uploaded_file is not None:
             bin_labels = []
             for i in range(len(bins)-1):
                 center = (bins[i] + bins[i+1]) / 2
-                # FIX: Correctly close with ')' except last bin, which closes with ']'
+                # Close last bin with ']', others with ')'
                 if i == len(bins) - 2:
                     label = f"[{bins[i]:.4f}, {bins[i+1]:.4f}] | center: {center:.4f}"
                 else:
@@ -666,10 +681,15 @@ if uploaded_file is not None:
                 cells_sorted = sort_cells_ascending(cells_in_bin)
                 st.markdown(f"**Cells in bin {chosen_bin}:**")
                 if cells_sorted:
-                    # Show the Excel letter next to each raw cell name (Cell 1 = B, Cell 2 = C, ...)
                     st.markdown("\n".join(
                         f"{i}. {cell} ({cell_to_excel_letter(cell)})"
                         for i, cell in enumerate(cells_sorted, start=1)
                     ))
                 else:
                     st.markdown("None")
+
+# Optional: quick cache reset button (handy after code edits to bounds/models)
+with st.expander("Advanced"):
+    if st.button("Clear cached data & fits"):
+        st.cache_data.clear()
+        st.success("Cleared Streamlit cache. Re-run to refit with current code.")
