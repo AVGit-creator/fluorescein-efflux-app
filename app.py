@@ -313,6 +313,14 @@ def create_trace(x, y, y_fit, label, color):
         traces.append(go.Scatter(x=x, y=y_fit, mode='lines', name=f'{label} Fit', line=dict(color=color, dash='dash')))
     return traces
 
+# --- NEW: generate as many distinct colors as needed ---
+def distinct_colors(n: int):
+    """
+    Generate n visually distinct colors (no repeats) using HSL spaced by the golden angle.
+    Plotly accepts 'hsl(H, S%, L%)' strings directly.
+    """
+    return [f"hsl({(i * 137.508) % 360:.1f}, 70%, 45%)" for i in range(n)]
+
 def get_y_range_rounded(cells, fit_results, round_base=5, padding_fraction=0.1):
     all_y = []
     for cell in cells:
@@ -447,25 +455,39 @@ if uploaded_file is not None:
     buf = (x_max - x_min) * 0.02 if x_max > x_min else 0.1
     x_range = [x_min - buf, x_max + buf]
 
+    # ---------- UPDATED: overlay only successful fits ----------
     if all_overlay:
-        st.write("### Overlay of All Cells")
+        st.write("### Overlay of All Cells (successful fits only)")
         fig = go.Figure()
-        for i, (cell, r) in enumerate(fit_results.items()):
+
+        successes = [(cell, r) for cell, r in fit_results.items() if r["status"] == "Success"]
+
+        for i, (cell, r) in enumerate(successes):
             clr = f'rgba({(i*53)%255},{(i*97)%255},{(i*191)%255},0.5)'
             label = cell_with_letter(cell) if is_exp_mode else cell
-            fig.add_trace(go.Scatter(x=x, y=r['ydata'], mode='lines+markers', name=label,
-                                     line=dict(color=clr), marker=dict(size=4, opacity=0.6)))
-        y0, y1 = get_y_range_rounded(fit_results.keys(), fit_results)
+            fig.add_trace(go.Scatter(
+                x=x, y=r['ydata'], mode='lines+markers', name=label,
+                line=dict(color=clr), marker=dict(size=4, opacity=0.6)
+            ))
+
+        if successes:
+            y0, y1 = get_y_range_rounded([c for c, _ in successes], fit_results)
+            yaxis_cfg = dict(title="Intensity", range=[y0, y1])
+        else:
+            yaxis_cfg = dict(title="Intensity")
+
         fig.update_layout(title="Overlay of All Cells",
                           xaxis=dict(title="Time", range=x_range, zeroline=False),
-                          yaxis=dict(title="Intensity", range=[y0, y1]),
+                          yaxis=yaxis_cfg,
                           height=600, margin=dict(l=40, r=40, t=50, b=50))
         st.plotly_chart(fig, use_container_width=True)
+
     elif sel:
         y0g, y1g = get_y_range_rounded(sel, fit_results)
         if mode == "Overlay":
             fig = go.Figure()
-            colors = ['blue','red','green','orange','purple','brown','pink','gray']
+            # --- generate enough distinct colors for any number of selections ---
+            colors = distinct_colors(len(sel))
             for cell, col in zip(sel, colors):
                 r = fit_results[cell]
                 label = cell_with_letter(cell) if is_exp_mode else cell
@@ -570,7 +592,7 @@ if uploaded_file is not None:
         if len(k_filt) == 0:
             st.write("No k values less than or equal to the cap to plot.")
         else:
-            # ---- NEW: explicit bin size controls ----
+            # ---- Bin size controls ----
             bin_mode = st.radio(
                 "Binning method",
                 ["Auto (adaptive)", "By number of bins", "By bin width"],
@@ -584,22 +606,24 @@ if uploaded_file is not None:
                 bin_edges = np.linspace(0.0, max_k_cap, n_bins + 1)
 
             elif bin_mode == "By bin width":
-                # Ensure a sensible default width from data spread (30 bins target)
-                default_width = max(max_k_cap / 30.0, 1e-6)
-                bin_width = st.number_input(
+                # UPDATED: accept arbitrary precision input and build bins without float-mod quirks
+                default_width = max(max_k_cap / 30.0, 1e-12)
+                bin_width_str = st.text_input(
                     "Bin width",
-                    min_value=1e-6,
-                    max_value=max(1e-6, float(max_k_cap)),
-                    value=float(np.round(default_width, 6)),
-                    step=0.0001,
-                    format="%.6f",
-                    help="Set the width of each bin. Bins start at 0 and extend to the cap."
+                    value=f"{default_width:.12g}",
+                    help="Enter any positive number. Bins start at 0 and extend to the cap (rounded up to the next multiple)."
                 )
-                # Guard against zero/NaN
-                bin_width = float(bin_width) if (bin_width is not None and bin_width > 0) else default_width
-                # Make sure last edge reaches (or slightly exceeds) max_k_cap
-                last_edge = max_k_cap + (bin_width - (max_k_cap % bin_width)) % bin_width
-                bin_edges = np.arange(0.0, last_edge + bin_width / 2, bin_width)
+                try:
+                    bin_width = float(bin_width_str)
+                    if not np.isfinite(bin_width) or bin_width <= 0:
+                        raise ValueError
+                except Exception:
+                    st.error("Please enter a positive numeric bin width.")
+                    bin_width = default_width
+
+                # Number of bins to reach/exceed cap (stable ceil, no % on floats)
+                n_bins = max(1, int(math.ceil(max_k_cap / bin_width)))
+                bin_edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
 
             else:  # Auto (adaptive) — original behavior
                 non_zero_k_vals = k_filt[k_filt > 0]
