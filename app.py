@@ -48,12 +48,12 @@ def parse_float_list(s):
 
 if eq_mode == "Custom equation":
     with st.container():
-        st.markdown("**Enter your equation in terms of `x` and your parameters.**")
-        st.caption("Example: `y0 + A * np.exp(-x / Tau)` or `B / (1 + (x/x0)**n)`")
+        st.markdown("**Enter your equation in terms of x and your parameters.**")
+        st.caption("Example: y0 + A * np.exp(-x / Tau) or B / (1 + (x/x0)**n)")
         custom_eq = st.text_input(
             "Equation (RHS only):",
             value="y0 + A * np.exp(-x / Tau)",
-            help="Write only the right-hand side; `y =` is not needed. You can use NumPy via `np.`"
+            help="Write only the right-hand side; y = is not needed. You can use NumPy via np."
         )
         params_str = st.text_input(
             "Parameter names (comma-separated, order matters):",
@@ -455,14 +455,26 @@ if uploaded_file is not None:
     buf = (x_max - x_min) * 0.02 if x_max > x_min else 0.1
     x_range = [x_min - buf, x_max + buf]
 
-    # ---------- UPDATED: overlay only successful fits ----------
+    # ---------- OVERLAY: include ALL cells (successful and failed) ----------
     if all_overlay:
-        st.write("### Overlay of All Cells (successful fits only)")
+        st.write("### Overlay of All Cells")
+
+        # NEW: sub-toggle to hide failed fits (shows ONLY successful fits when checked)
+        only_success_in_overlay = st.checkbox(
+            "Remove failed fits from this overlay",
+            value=True,
+            key="overlay_rm_failed"
+        )
+
         fig = go.Figure()
 
-        successes = [(cell, r) for cell, r in fit_results.items() if r["status"] == "Success"]
+        # Build the list to plot based on the sub-toggle
+        if only_success_in_overlay:
+            all_items = [(c, r) for c, r in fit_results.items() if r.get("status") == "Success"]
+        else:
+            all_items = list(fit_results.items())
 
-        for i, (cell, r) in enumerate(successes):
+        for i, (cell, r) in enumerate(all_items):
             clr = f'rgba({(i*53)%255},{(i*97)%255},{(i*191)%255},0.5)'
             label = cell_with_letter(cell) if is_exp_mode else cell
             fig.add_trace(go.Scatter(
@@ -470,16 +482,18 @@ if uploaded_file is not None:
                 line=dict(color=clr), marker=dict(size=4, opacity=0.6)
             ))
 
-        if successes:
-            y0, y1 = get_y_range_rounded([c for c, _ in successes], fit_results)
+        if all_items:
+            y0, y1 = get_y_range_rounded([c for c, _ in all_items], fit_results)
             yaxis_cfg = dict(title="Intensity", range=[y0, y1])
         else:
             yaxis_cfg = dict(title="Intensity")
 
-        fig.update_layout(title="Overlay of All Cells",
-                          xaxis=dict(title="Time", range=x_range, zeroline=False),
-                          yaxis=yaxis_cfg,
-                          height=600, margin=dict(l=40, r=40, t=50, b=50))
+        fig.update_layout(
+            title="Overlay of All Cells" if not only_success_in_overlay else "Overlay of Successful Fits",
+            xaxis=dict(title="Time", range=x_range, zeroline=False),
+            yaxis=yaxis_cfg,
+            height=600, margin=dict(l=40, r=40, t=50, b=50)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     elif sel:
@@ -566,31 +580,31 @@ if uploaded_file is not None:
         )
     )
 
-    # --- HISTOGRAM ---
-    st.write("## Histogram of kMDR values")
+    # --- HISTOGRAM (UPDATED) ---
+    st.write("## Histogram of k values")
     k_vals = df_table.loc[df_table['Status'] == 'Success', 'k'].dropna().values
 
     if len(k_vals) == 0:
         st.write("No successful fits with valid k values to plot histogram.")
     else:
+        # Editable title; default to "Histogram of k values"
+        hist_title = st.text_input("Histogram title", value="Histogram of k values")
+
+        # Use full k range (cap slider removed)
         min_k, max_k = 0.0, float(np.max(k_vals))
-        max_k_cap = st.slider(
-            "Cap maximum k value for histogram (values above cap are excluded)",
-            min_value=min_k, max_value=max_k, value=max_k, step=0.001
-        )
         hist_color = st.color_picker("Select histogram bar color", value="#1f77b4")
         show_bars = st.checkbox("Show Histogram Bars", True)
         show_step = st.checkbox("Show Step Plot", True)
 
-        # Use the raw cell names here to preserve sorting and mapping
+        # Use all valid k values (no cap filtering)
         k_source = df_table.loc[
-            (df_table['Status'] == 'Success') & df_table['k'].notna() & (df_table['k'] <= max_k_cap),
+            (df_table['Status'] == 'Success') & df_table['k'].notna(),
             ['CellRaw', 'k']
         ].rename(columns={'CellRaw': 'Cell'})
         k_filt = k_source['k'].values
 
         if len(k_filt) == 0:
-            st.write("No k values less than or equal to the cap to plot.")
+            st.write("No k values to plot.")
         else:
             # ---- Bin size controls ----
             bin_mode = st.radio(
@@ -603,15 +617,15 @@ if uploaded_file is not None:
 
             if bin_mode == "By number of bins":
                 n_bins = st.slider("Number of bins", min_value=1, max_value=200, value=30)
-                bin_edges = np.linspace(0.0, max_k_cap, n_bins + 1)
+                bin_edges = np.linspace(0.0, max_k, n_bins + 1)
 
             elif bin_mode == "By bin width":
-                # UPDATED: accept arbitrary precision input and build bins without float-mod quirks
-                default_width = max(max_k_cap / 30.0, 1e-12)
+                # Accept arbitrary precision input and build bins without float-mod quirks
+                default_width = max(max_k / 30.0, 1e-12)
                 bin_width_str = st.text_input(
                     "Bin width",
                     value=f"{default_width:.12g}",
-                    help="Enter any positive number. Bins start at 0 and extend to the cap (rounded up to the next multiple)."
+                    help="Enter any positive number. Bins start at 0 and extend to the maximum k (rounded up to the next multiple)."
                 )
                 try:
                     bin_width = float(bin_width_str)
@@ -621,15 +635,15 @@ if uploaded_file is not None:
                     st.error("Please enter a positive numeric bin width.")
                     bin_width = default_width
 
-                # Number of bins to reach/exceed cap (stable ceil, no % on floats)
-                n_bins = max(1, int(math.ceil(max_k_cap / bin_width)))
+                # Number of bins to reach/exceed max_k (stable ceil, no % on floats)
+                n_bins = max(1, int(math.ceil(max_k / bin_width)))
                 bin_edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
 
-            else:  # Auto (adaptive) — original behavior
+            else:  # Auto (adaptive)
                 non_zero_k_vals = k_filt[k_filt > 0]
-                min_nonzero_k = np.min(non_zero_k_vals) if len(non_zero_k_vals) > 0 else max_k_cap
+                min_nonzero_k = np.min(non_zero_k_vals) if len(non_zero_k_vals) > 0 else max_k
                 bin_edges = [0.0, min_nonzero_k]
-                bin_edges += list(np.linspace(min_nonzero_k, max_k_cap, num=30)[1:])
+                bin_edges += list(np.linspace(min_nonzero_k, max_k, num=30)[1:])
                 bin_edges = np.round(bin_edges, 6)
 
             counts, bins = np.histogram(k_filt, bins=bin_edges)
@@ -669,8 +683,9 @@ if uploaded_file is not None:
                 ))
 
             fig_hist.update_layout(
-                title="Histogram of kMDR Values",
-                xaxis=dict(title="k<sub>MDR</sub> (min<sup>-1</sup>)", range=[0.0, max_k_cap]),
+                # Use editable title
+                title=hist_title,
+                xaxis=dict(title="k values (min<sup>-1</sup>)", range=[0.0, max_k]),
                 yaxis=dict(title="Count", range=[0, y_max_limit]),
                 height=450,
                 bargap=0.2,
