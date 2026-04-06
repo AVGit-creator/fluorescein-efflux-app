@@ -10,8 +10,8 @@ import re
 # =========================
 # TOP-OF-PAGE: Equation Selector
 # =========================
-st.set_page_config(page_title="Fluorescein Efflux Single-Cell Kinetics", layout="centered")
-st.title("Fluorescein Efflux Single-Cell Kinetics")
+st.set_page_config(page_title="CRRC Web Application", layout="centered")
+st.title("CRRC Web Application")
 
 st.markdown("### Model Selection")
 eq_mode = st.radio(
